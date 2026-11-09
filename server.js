@@ -1,4 +1,5 @@
 
+
 import express from "express";
 import multer from "multer";
 import OpenAI from "openai";
@@ -8,23 +9,42 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 const app = express();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PUBLIC_DIR = path.join(__dirname, "public");
+const OUTPUT_DIR = path.join(__dirname, "outputs");
+
+fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const upload = multer({
   dest: os.tmpdir(),
   limits: { fileSize: 500 * 1024 * 1024 }
 });
 
-app.use(express.static("public"));
-app.use("/outputs", express.static(path.resolve("outputs")));
+app.use(express.json());
+app.use(express.static(PUBLIC_DIR));
+app.use("/outputs", express.static(OUTPUT_DIR));
+
+// Página principal
+app.get("/", (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
+});
+
+// Comprobar servidor
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", app: "Clipia AI" });
+});
 
 const run = (args) => new Promise((resolve, reject) => {
   const p = spawn(ffmpegPath, args);
   let err = "";
 
   p.stderr.on("data", d => err += d.toString());
-
   p.on("error", reject);
 
   p.on("close", code => {
@@ -57,12 +77,15 @@ app.post("/api/process", upload.single("video"), async (req, res) => {
 
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({
-        error: "Falta configurar OPENAI_API_KEY."
+        error: "Falta configurar OPENAI_API_KEY en Render."
       });
     }
 
+    if (!ffmpegPath) {
+      throw new Error("No se encontró FFmpeg.");
+    }
+
     fs.mkdirSync(work, { recursive: true });
-    fs.mkdirSync("outputs", { recursive: true });
 
     const openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY
@@ -85,7 +108,6 @@ app.post("/api/process", upload.single("video"), async (req, res) => {
       let output = "";
 
       p.stderr.on("data", d => output += d.toString());
-
       p.on("error", reject);
 
       p.on("close", () => {
@@ -109,7 +131,7 @@ app.post("/api/process", upload.single("video"), async (req, res) => {
       throw new Error("El video es demasiado corto.");
     }
 
-    // 3. Dividir audio para transcripción
+    // 3. Transcribir audio por partes
     const chunkSeconds = 480;
     const transcriptSegments = [];
 
@@ -146,7 +168,7 @@ app.post("/api/process", upload.single("video"), async (req, res) => {
       throw new Error("No se detectó suficiente voz.");
     }
 
-    // 4. Analizar momentos destacados
+    // 4. Encontrar los mejores momentos
     const transcript = transcriptSegments
       .map(s => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`)
       .join("\n");
@@ -158,19 +180,19 @@ app.post("/api/process", upload.single("video"), async (req, res) => {
         {
           role: "system",
           content: `
-Eres un editor profesional de videos virales.
+Eres un editor profesional de videos.
 
 Selecciona exactamente 5 momentos destacados.
 
 Cada clip debe:
 - Durar entre 30 y 60 segundos.
 - Tener un inicio atractivo.
-- Mantener contexto.
+- Mantener el contexto.
 - Evitar cortes a mitad de frase.
 - Tener potencial para TikTok, Reels y Shorts.
 - No inventar frases.
 
-Devuelve JSON:
+Devuelve solamente JSON:
 {
   "clips": [
     {
@@ -183,7 +205,7 @@ Devuelve JSON:
 }
 
 Los tiempos deben corresponder al video original.
-Ordena los clips por potencial de retención.
+Ordena por potencial de retención.
 `
         },
         {
@@ -215,11 +237,11 @@ Ordena los clips por potencial de retención.
 
     if (clips.length !== 5) {
       throw new Error(
-        "La IA no encontró exactamente 5 momentos de 30 a 60 segundos. Prueba con un video más largo."
+        "No se encontraron 5 clips válidos. Prueba con otro video."
       );
     }
 
-    // 5. Crear los cinco videos
+    // 5. Crear los cinco clips verticales
     const id = crypto.randomUUID();
     const results = [];
 
@@ -234,7 +256,10 @@ Ordena los clips por potencial de retención.
 
       const srt = selected.map((s, n) => {
         const a = Math.max(0, s.start - start);
-        const b = Math.max(a + 0.2, Math.min(end - start, s.end - start));
+        const b = Math.max(
+          a + 0.2,
+          Math.min(end - start, s.end - start)
+        );
 
         return `${n + 1}\n${fmt(a)} --> ${fmt(b)}\n${s.text}\n`;
       }).join("\n");
@@ -243,7 +268,7 @@ Ordena los clips por potencial de retención.
       fs.writeFileSync(srtPath, srt, "utf8");
 
       const outName = `${id}-${i + 1}.mp4`;
-      const outPath = path.resolve("outputs", outName);
+      const outPath = path.join(OUTPUT_DIR, outName);
 
       const escapedSrt = srtPath
         .replace(/\\/g, "/")
@@ -283,7 +308,7 @@ Ordena los clips por potencial de retención.
     });
 
   } catch (e) {
-    console.error(e);
+    console.error("Error procesando video:", e);
 
     res.status(500).json({
       error: e.message || "Error procesando el video."
@@ -301,9 +326,8 @@ Ordena los clips por potencial de retención.
   }
 });
 
-const port = process.env.PORT || 3000;
-
-app.listen(port, () => {
-  console.log(`Clipia AI lista en puerto ${port}`);
+app.listen(process.env.PORT || 3000, "0.0.0.0", () => {
+  console.log(`Clipia AI lista en puerto ${process.env.PORT || 3000}`);
 });
+
 
